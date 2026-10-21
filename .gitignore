@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+data.json
+operations.log
+data.json.tmp
+venv/

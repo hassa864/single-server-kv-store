@@ -1,0 +1,29 @@
+{
+  "shards": 2,
+  "keys": 3000,
+  "threads": 16,
+  "write": {
+    "operations": 3000,
+    "successful": 3000,
+    "errors": 0,
+    "elapsed_seconds": 6.8369,
+    "throughput_ops_sec": 438.79,
+    "mean_latency_ms": 36.308,
+    "p50_latency_ms": 35.636,
+    "p95_latency_ms": 53.517,
+    "p99_latency_ms": 65.688,
+    "sample_errors": []
+  },
+  "read": {
+    "operations": 3000,
+    "successful": 3000,
+    "errors": 0,
+    "elapsed_seconds": 5.169,
+    "throughput_ops_sec": 580.38,
+    "mean_latency_ms": 27.461,
+    "p50_latency_ms": 26.018,
+    "p95_latency_ms": 39.698,
+    "p99_latency_ms": 50.969,
+    "sample_errors": []
+  }
+}

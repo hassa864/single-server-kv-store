@@ -1,161 +1,116 @@
-"""KV-store benchmark: write every key, then read every key back and verify its value.
 
-Usage:
-  python kv_bench.py          # set phase, then get phase (read-after-write within one run)
-  python kv_bench.py set      # write only
-  python kv_bench.py get      # read + verify only, e.g. after restarting the server (durability)
+"""Concurrent write/read benchmark for 1, 2, or 3 KV shards.
+
+Writes a machine-readable JSON result to benchmark-results.json unless --output changes it.
 """
-import queue
-import sys
+import argparse
+import concurrent.futures
+import json
+import math
+import statistics
 import threading
 import time
-
 import requests
 
-BASE_URL = 'http://127.0.0.1:8080'
-NUM_THREADS = 3
-OPS_PER_THREAD = 100
-NUM_KEYS = NUM_THREADS * OPS_PER_THREAD   # keys per phase
-PRINT_INTERVAL = 3                        # seconds between intermediate reports
-MAX_LOGGED_PROBLEMS = 5                   # print the first few errors/mismatches, count the rest
 
-_local = threading.local()
-_log_lock = threading.Lock()
-_logged = 0
+# Calculates a latency percentile and convert the result from seconds to milliseconds.
+def percentile(values, p):
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[min(math.ceil(p * len(ordered)) - 1, len(ordered) - 1)] * 1000
 
 
-def log_problem(msg):
-    global _logged
-    with _log_lock:
-        _logged += 1
-        if _logged <= MAX_LOGGED_PROBLEMS:
-            print(msg)
-        elif _logged == MAX_LOGGED_PROBLEMS + 1:
-            print("  (further errors/mismatches suppressed; see counts in the results)")
+# Runs either a write or read benchmark using multiple concurrent threads.
+def run_phase(base_url, operation, keys, threads):
+    # Stores successful operation times and any errors encountered.
+    latencies = []
+    errors = []
+    lock = threading.Lock()
 
+    # Records the start time for the entire benchmark phase.
+    start = time.perf_counter()
 
-def session():
-    # One pooled connection per thread, so we time the store rather than TCP setup.
-    # requests.Session is not meant to be shared across threads.
-    if not hasattr(_local, 'session'):
-        _local.session = requests.Session()
-    return _local.session
-
-
-def kv_store_operation(op_type, key, value):
-    """Returns 'ok', 'mismatch', or 'error'. For 'get', value is the expected value."""
-    try:
-        if op_type == 'set':
-            r = session().post(f"{BASE_URL}/{key}", json={'value': value})
-            r.raise_for_status()
-            return 'ok'
-        if op_type == 'get':
-            r = session().get(f"{BASE_URL}/{key}")
-            r.raise_for_status()
-            got = r.json().get('value')   # adjust if your server returns a different shape
-            if got == value:
-                return 'ok'
-            log_problem(f"Mismatch on get '{key}': expected {value!r}, got {got!r}")
-            return 'mismatch'
-        raise ValueError(f"Invalid operation type: {op_type}")
-    except Exception as e:
-        log_problem(f"Error during {op_type} for '{key}': {e}")
-        return 'error'
-
-
-class PhaseStats:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.latencies = []   # successful ops only
-        self.mismatch = 0
-        self.error = 0
-
-
-def worker(q, stats, barrier):
-    barrier.wait()   # release all workers together
-    while True:
+    def task(i):
+        # Generates a unique key and its expected value for each operation.
+        key, value = f"bench_{i}", f"value_{i}"
+        began = time.perf_counter()
         try:
-            op, key, value = q.get_nowait()   # avoids the empty()/get() race
-        except queue.Empty:
-            return
-        t0 = time.perf_counter()
-        status = kv_store_operation(op, key, value)
-        latency = time.perf_counter() - t0
-        with stats.lock:
-            if status == 'ok':
-                stats.latencies.append(latency)
-            elif status == 'mismatch':
-                stats.mismatch += 1
+            # Sends a POST request to store a value or a GET request to retrieve it.
+            if operation == "write":
+                response = requests.post(f"{base_url}/{key}", json={"value": value}, timeout=20)
+                response.raise_for_status()
             else:
-                stats.error += 1
+                response = requests.get(f"{base_url}/{key}", timeout=20)
+                response.raise_for_status()
+
+                # Verifies that the retrieved value matches the expected value.
+                if response.json().get("value") != value:
+                    raise AssertionError(f"incorrect value for {key}")
+
+            # Measures how long the individual request took.
+            elapsed = time.perf_counter() - began
+            with lock:
+                latencies.append(elapsed)
+        except Exception as exc:
+            # Records errors safely because multiple threads may fail simultaneously.
+            with lock:
+                errors.append(str(exc))
+
+    # Executes all operations using the specified number of worker threads.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
+        list(pool.map(task, range(keys)))
+
+    # Calculates the total time taken to complete this benchmark phase.
+    elapsed = time.perf_counter() - start
+    return {
+        # Includes operation counts and the number of successful requests and errors.
+        "operations": keys, "successful": len(latencies), "errors": len(errors),
+        "elapsed_seconds": round(elapsed, 4),
+
+        # Calculates throughput as successful operations completed per second.
+        "throughput_ops_sec": round(len(latencies) / elapsed, 2) if elapsed else 0,
+
+        # Calculates average latency and the 50th, 95th, and 99th percentile latencies.
+        "mean_latency_ms": round(statistics.mean(latencies) * 1000, 3) if latencies else None,
+        "p50_latency_ms": round(percentile(latencies, .50), 3) if latencies else None,
+        "p95_latency_ms": round(percentile(latencies, .95), 3) if latencies else None,
+        "p99_latency_ms": round(percentile(latencies, .99), 3) if latencies else None,
+
+        # Includes up to three example errors to help diagnose failed requests.
+        "sample_errors": errors[:3],
+    }
 
 
-def monitor(stats, stop):
-    # Reads new latencies without consuming them, so the final stats stay complete.
-    seen, last = 0, time.perf_counter()
-    while not stop.wait(PRINT_INTERVAL):
-        with stats.lock:
-            window = stats.latencies[seen:]
-        now = time.perf_counter()
-        if window:
-            print(f"  [last {now - last:.1f}s] {len(window) / (now - last):.1f} ops/s, "
-                  f"avg latency {1e3 * sum(window) / len(window):.2f} ms")
-        seen += len(window)
-        last = now
+def main():
+    # Defines command-line options for configuring the benchmark.
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base-url", default="http://127.0.0.1:8080")
+    parser.add_argument("--keys", type=int, default=1000)
+    parser.add_argument("--threads", type=int, default=16)
+    parser.add_argument("--output", default="benchmark-results.json")
+    args = parser.parse_args()
+
+    # Checks that the KV-store gateway is responding before starting the benchmark.
+    health = requests.get(f"{args.base_url}/health", timeout=5)
+    health.raise_for_status()
+
+    # Reads the number of configured shards from the health response.
+    shards = health.json().get("shards", 1)
+
+    # Runs the write and read phases and collect their performance measurements.
+    result = {"shards": shards, "keys": args.keys, "threads": args.threads,
+              "write": run_phase(args.base_url, "write", args.keys, args.threads),
+              "read": run_phase(args.base_url, "read", args.keys, args.threads)}
+
+    # Saves the benchmark results as formatted JSON in the requested output file.
+    with open(args.output, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+
+    # Also prints the results to the terminal for immediate review.
+    print(json.dumps(result, indent=2))
 
 
-def run_phase(op_type):
-    q = queue.Queue()
-    for i in range(NUM_KEYS):
-        # For 'set' this is the value to write; for 'get' it is the value we expect back.
-        q.put((op_type, f"key_{i}", f"value_{i}"))
-
-    stats = PhaseStats()
-    barrier = threading.Barrier(NUM_THREADS + 1)
-    stop = threading.Event()
-    workers = [threading.Thread(target=worker, args=(q, stats, barrier))
-               for _ in range(NUM_THREADS)]
-    mon = threading.Thread(target=monitor, args=(stats, stop), daemon=True)
-
-    for t in workers:
-        t.start()
-    mon.start()
-    barrier.wait()
-    t0 = time.perf_counter()
-    for t in workers:
-        t.join()
-    elapsed = time.perf_counter() - t0
-    stop.set()
-    mon.join()
-    return stats, elapsed
-
-
-def report(name, stats, elapsed):
-    lats = sorted(stats.latencies)
-    ok = len(lats)
-    avg = 1e3 * sum(lats) / ok if ok else float('nan')
-    p99 = 1e3 * lats[int(0.99 * (ok - 1))] if ok else float('nan')
-    print(f"{name}: ok={ok} mismatch={stats.mismatch} error={stats.error} "
-          f"time={elapsed:.2f}s throughput={ok / elapsed:.1f} ops/s "
-          f"avg={avg:.2f} ms p99={p99:.2f} ms")
-    return ok
-
-
-if __name__ == '__main__':
-    phases = sys.argv[1:] or ['set', 'get']
-    if any(p not in ('set', 'get') for p in phases):
-        sys.exit("usage: python kv_bench.py [set] [get]")
-
-    results = {}
-    for phase in phases:
-        print(f"Running {phase} phase on {NUM_KEYS} keys with {NUM_THREADS} threads...")
-        results[phase] = run_phase(phase)
-
-    print("\nFinal Results:")
-    total_ok, total_time = 0, 0.0
-    for phase, (stats, elapsed) in results.items():
-        total_ok += report(phase.upper(), stats, elapsed)
-        total_time += elapsed
-    # Each successful request counts once: no multiplier.
-    print(f"TOTAL: {total_ok} successful ops in {total_time:.2f}s "
-          f"({total_ok / total_time:.1f} ops/s)")
+# Runs the benchmark when this script is executed directly.
+if __name__ == "__main__":
+    main()

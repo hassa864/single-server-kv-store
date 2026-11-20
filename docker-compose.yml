@@ -1,0 +1,50 @@
+services:
+  kv1:
+    build: .
+    command: ["python", "node.py"]
+    environment: {SHARD_NAME: kv1, DATA_FILE: /data/data.json}
+    volumes: [kv1-data:/data]
+    expose: ["8081"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/health')"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+  kv2:
+    build: .
+    command: ["python", "node.py"]
+    environment: {SHARD_NAME: kv2, DATA_FILE: /data/data.json}
+    volumes: [kv2-data:/data]
+    expose: ["8081"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/health')"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+  kv3:
+    build: .
+    command: ["python", "node.py"]
+    environment: {SHARD_NAME: kv3, DATA_FILE: /data/data.json}
+    volumes: [kv3-data:/data]
+    expose: ["8081"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/health')"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+  gateway:
+    build: .
+    command: ["python", "gateway.py"]
+    environment:
+      KV_NODES: ${KV_NODES:-http://kv1:8081,http://kv2:8081,http://kv3:8081}
+      VIRTUAL_NODES: ${VIRTUAL_NODES:-128}
+      MIGRATION_NODES: http://kv1:8081,http://kv2:8081,http://kv3:8081
+    ports: ["8080:8080"]
+    depends_on:
+      kv1: {condition: service_healthy}
+      kv2: {condition: service_healthy}
+      kv3: {condition: service_healthy}
+volumes:
+  kv1-data:
+  kv2-data:
+  kv3-data:
